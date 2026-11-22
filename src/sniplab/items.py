@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
                                QGraphicsRectItem, QGraphicsTextItem)
@@ -80,14 +80,19 @@ class StepItem(QGraphicsEllipseItem):
 
 
 class TextItem(QGraphicsTextItem):
+    # Emitted when an editing session ends: (item, text_before, text_after).
+    # The canvas turns this into an undo command.
+    edited = Signal(object, str, str)
+
     def __init__(self, color: QColor, point_size: int = 20):
         super().__init__("")
+        self.is_new = True          # True until the canvas has recorded it for undo
+        self._text_before = ""
         self.setDefaultTextColor(color)
         font = QFont("Segoe UI", point_size)
         font.setBold(True)
         self.setFont(font)
         self.setFlags(MOVABLE)
-        self.begin_edit()
 
     def begin_edit(self):
         self.setTextInteractionFlags(Qt.TextEditorInteraction)
@@ -97,11 +102,16 @@ class TextItem(QGraphicsTextItem):
         self.begin_edit()
         super().mouseDoubleClickEvent(event)
 
+    def focusInEvent(self, event):
+        self._text_before = self.toPlainText()
+        super().focusInEvent(event)
+
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         cursor = self.textCursor()
         cursor.clearSelection()
         self.setTextCursor(cursor)
-        if not self.toPlainText().strip() and self.scene() is not None:
-            self.scene().removeItem(self)
+        after = self.toPlainText()
+        if self.is_new or after != self._text_before:
+            self.edited.emit(self, self._text_before, after)
