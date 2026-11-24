@@ -125,7 +125,6 @@ class Canvas(QGraphicsView):
         self.tool = "select"
         self._start: QPointF | None = None
         self._cur = None
-        self._step = 1
         self._snap: dict = {}          # item -> state at mouse press (for move undo)
         self._resize: dict | None = None
         self.setMouseTracking(True)
@@ -293,6 +292,15 @@ class Canvas(QGraphicsView):
             item.setRect(rect)
 
     # --- mouse ---------------------------------------------------------
+    def next_step_number(self) -> int:
+        """Highest step number currently on the canvas, plus one.
+
+        Derived from what is actually in the scene, so deleting or undoing the
+        last step frees its number, while a gap in the middle is ignored.
+        """
+        numbers = [it.number for it in self.scene().items() if isinstance(it, StepItem)]
+        return max(numbers, default=0) + 1
+
     def _text_edited(self, item: TextItem, before: str, after: str):
         """Turn a finished text-editing session into one undo step."""
         scene = self.scene()
@@ -343,10 +351,9 @@ class Canvas(QGraphicsView):
             item.begin_edit()
             return
         if self.tool == "step":
-            item = StepItem(self._step, self.color)
+            item = StepItem(self.next_step_number(), self.color)
             item.setFlags(MOVABLE)
             item.setPos(pos)
-            self._step += 1
             self.undo_stack.push(AddCommand(self.scene(), item, "Add step"))
             return
 
