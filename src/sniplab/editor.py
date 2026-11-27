@@ -67,9 +67,48 @@ class CropCommand(QUndoCommand):
         self.canvas.set_canvas_rect(self.old)
 
 
+def get_color(item) -> QColor | None:
+    """The user-facing colour of an annotation, or None if it has none (blur)."""
+    if isinstance(item, PixelateItem):
+        return None
+    if isinstance(item, TextItem):
+        return QColor(item.defaultTextColor())
+    if isinstance(item, StepItem):
+        return QColor(item.brush().color())
+    if isinstance(item, QGraphicsLineItem):          # line and arrow
+        return QColor(item.pen().color())
+    if isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem)):
+        if item.pen().style() == Qt.NoPen:           # highlighter: filled, no outline
+            return QColor(item.brush().color())
+        return QColor(item.pen().color())
+    return None
+
+
+def set_color(item, color: QColor):
+    color = QColor(color)
+    if isinstance(item, PixelateItem):
+        return
+    if isinstance(item, TextItem):
+        item.setDefaultTextColor(color)
+    elif isinstance(item, StepItem):
+        item.setBrush(color)
+    elif isinstance(item, (QGraphicsLineItem, QGraphicsRectItem, QGraphicsEllipseItem)):
+        if not isinstance(item, QGraphicsLineItem) and item.pen().style() == Qt.NoPen:
+            color.setAlpha(item.brush().color().alpha())   # keep highlighter see-through
+            item.setBrush(color)
+        else:
+            pen = item.pen()
+            pen.setColor(color)
+            item.setPen(pen)
+    item.update()
+
+
 def get_state(item) -> dict:
     """Snapshot everything about an item that the user can change."""
     state = {"pos": QPointF(item.pos()), "scale": item.scale()}
+    color = get_color(item)
+    if color is not None:
+        state["color"] = color
     if isinstance(item, QGraphicsLineItem):
         state["line"] = QLineF(item.line())
     elif isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem)):
@@ -82,6 +121,8 @@ def get_state(item) -> dict:
 def set_state(item, state: dict):
     item.setPos(state["pos"])
     item.setScale(state["scale"])
+    if "color" in state:
+        set_color(item, state["color"])
     if "line" in state:
         item.setLine(state["line"])
     if "rect" in state:
@@ -424,6 +465,24 @@ class Canvas(QGraphicsView):
             return
         super().keyPressEvent(e)
 
+    def apply_color(self, color: QColor) -> int:
+        """Recolour the selected annotations as one undo step. Returns how many changed."""
+        changes = []
+        for item in self.scene().selectedItems():
+            old = get_state(item)
+            if "color" not in old:
+                continue
+            set_color(item, color)
+            new = get_state(item)
+            if new != old:
+                changes.append((item, old, new))
+        if changes:
+            self.undo_stack.beginMacro("Change colour")
+            for item, old, new in changes:
+                self.undo_stack.push(ModifyCommand(item, old, new, "Change colour"))
+            self.undo_stack.endMacro()
+        return len(changes)
+
     def delete_selected(self):
         items = self.scene().selectedItems()
         if not items:
@@ -533,8 +592,11 @@ class EditorWindow(QMainWindow):
     def _pick_color(self):
         c = QColorDialog.getColor(self.canvas.color, self, "Annotation colour")
         if c.isValid():
-            self.canvas.color = c
+            self.canvas.color = c            # also the colour for new annotations
             self._refresh_color_icon()
+            n = self.canvas.apply_color(c)   # and recolour whatever is selected
+            if n:
+                self.statusBar().showMessage(f"Changed colour of {n} item(s)", 3000)
 
     def _update_title(self):
         self.setWindowTitle(f"SnipLab - {self.path.name}")
