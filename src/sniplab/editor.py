@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QGuiApplication, QImage, QKeySequence,
                            QPainter, QPainterPath, QPen, QPixmap, QUndoCommand, QUndoStack)
-from PySide6.QtWidgets import (QColorDialog, QFileDialog, QGraphicsEllipseItem, QGraphicsLineItem,
+from PySide6.QtWidgets import (QColorDialog, QFileDialog, QGraphicsEllipseItem, QGraphicsItem,
+                               QGraphicsLineItem,
                                QGraphicsRectItem, QGraphicsScene, QGraphicsView, QLabel,
                                QMainWindow, QMessageBox, QSpinBox, QToolBar)
 
+from . import __version__
+from .icons import glyph_icon, has_glyph_font, swatch_icon, tool_icon
 from .items import MOVABLE, ArrowItem, PixelateItem, StepItem, TextItem
 
 TOOLS = [
@@ -105,7 +108,7 @@ def set_color(item, color: QColor):
 
 def get_state(item) -> dict:
     """Snapshot everything about an item that the user can change."""
-    state = {"pos": QPointF(item.pos()), "scale": item.scale()}
+    state = {"pos": QPointF(item.pos()), "scale": item.scale(), "z": item.zValue()}
     color = get_color(item)
     if color is not None:
         state["color"] = color
@@ -121,6 +124,7 @@ def get_state(item) -> dict:
 def set_state(item, state: dict):
     item.setPos(state["pos"])
     item.setScale(state["scale"])
+    item.setZValue(state["z"])
     if "color" in state:
         set_color(item, state["color"])
     if "line" in state:
@@ -147,6 +151,9 @@ class ModifyCommand(QUndoCommand):
 
 # --- canvas ----------------------------------------------------------------
 class Canvas(QGraphicsView):
+    cursor_moved = Signal(int, int)     # pointer position in image pixels
+    zoom_changed = Signal(float)        # 1.0 == 100%
+
     def __init__(self, image: QImage):
         super().__init__()
         self.base = image
@@ -192,16 +199,46 @@ class Canvas(QGraphicsView):
         sr = self.sceneRect()
         if sr.width() > vp.width() or sr.height() > vp.height():
             self.fitInView(sr, Qt.KeepAspectRatio)
+        self.zoom_changed.emit(self.transform().m11())
 
     def actual_size(self):
         self.resetTransform()
+        self.zoom_changed.emit(1.0)
+
+    def zoom_by(self, factor: float):
+        self.scale(factor, factor)
+        self.zoom_changed.emit(self.transform().m11())
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.ControlModifier:
-            factor = 1.15 ** (e.angleDelta().y() / 120)
-            self.scale(factor, factor)
+            self.zoom_by(1.15 ** (e.angleDelta().y() / 120))
         else:
             super().wheelEvent(e)
+
+    # --- selection / stacking order -------------------------------------------
+    def select_all(self):
+        for it in self.scene().items():
+            if it.flags() & QGraphicsItem.ItemIsSelectable:
+                it.setSelected(True)
+
+    def reorder(self, to_front: bool) -> int:
+        """Move the selected annotations above or below all the others (undoable)."""
+        selected = self.scene().selectedItems()
+        others = [it.zValue() for it in self.scene().items()
+                  if it.zValue() > -1000 and it not in selected]
+        if not selected or not others:
+            return 0
+        z = max(others) + 1 if to_front else min(others) - 1
+        changes = []
+        for it in selected:
+            old = get_state(it)
+            it.setZValue(z)
+            changes.append((it, old, get_state(it)))
+        self.undo_stack.beginMacro("Bring to front" if to_front else "Send to back")
+        for it, old, new in changes:
+            self.undo_stack.push(ModifyCommand(it, old, new, "Reorder"))
+        self.undo_stack.endMacro()
+        return len(changes)
 
     def drawForeground(self, painter: QPainter, rect: QRectF):
         # Hide anything lying outside the (possibly cropped) canvas.
@@ -405,6 +442,8 @@ class Canvas(QGraphicsView):
         self._apply_geometry(pos)
 
     def mouseMoveEvent(self, e):
+        sp = self.mapToScene(e.position().toPoint())
+        self.cursor_moved.emit(int(sp.x()), int(sp.y()))
         if self._resize is not None:
             self._do_resize(self.mapToScene(e.position().toPoint()))
             return
@@ -509,6 +548,8 @@ class Canvas(QGraphicsView):
 
 # --- window ----------------------------------------------------------------
 class EditorWindow(QMainWindow):
+    """Layout: menu bar on top, horizontal toolbar, vertical tool palette on the
+    left (Photoshop style), canvas in the middle, status bar at the bottom."""
     saved = Signal(str)
 
     def __init__(self, path: Path):
@@ -518,90 +559,229 @@ class EditorWindow(QMainWindow):
         image = QImage(str(self.path)).convertToFormat(QImage.Format_ARGB32)
         self.canvas = Canvas(image)
         self.setCentralWidget(self.canvas)
-        self._build_toolbar()
+
+        self.act: dict[str, QAction] = {}
+        self.tool_actions: dict[str, QAction] = {}
+        self._build_actions()
+        self._build_menus()
+        self._build_top_toolbar()
+        self._build_tool_palette()
+        self._build_status_bar()
         self._update_title()
 
         avail = QGuiApplication.primaryScreen().availableGeometry()
-        w = min(image.width() + 40, int(avail.width() * 0.9))
-        h = min(image.height() + 120, int(avail.height() * 0.9))
-        self.resize(max(w, 900), max(h, 500))
+        w = min(image.width() + 120, int(avail.width() * 0.9))
+        h = min(image.height() + 200, int(avail.height() * 0.9))
+        self.resize(max(w, 960), max(h, 560))
 
     def showEvent(self, e):
         super().showEvent(e)
         self.canvas.reset_view()
 
-    # --- UI -------------------------------------------------------------
-    def _build_toolbar(self):
-        tb = QToolBar("Tools")
-        tb.setMovable(False)
-        self.addToolBar(tb)
+    # --- actions -----------------------------------------------------------
+    def _action(self, key: str, text: str, handler, shortcut=None, icon=None, tip: str = ""):
+        act = QAction(text, self)
+        if icon is not None:
+            act.setIcon(icon)
+        if shortcut is not None:
+            act.setShortcut(shortcut if isinstance(shortcut, QKeySequence) else QKeySequence(shortcut))
+        if tip:
+            act.setToolTip(tip)
+        act.triggered.connect(lambda _=False, h=handler: h())
+        self.act[key] = act
+        return act
 
+    def _build_actions(self):
+        c = self.canvas
+        # File
+        self._action("save", "&Save", self.save, QKeySequence.Save, glyph_icon("save"), "Save (Ctrl+S)")
+        self._action("save_as", "Save &As...", self.save_as, "F12", glyph_icon("save_as"),
+                     "Save As (F12)")   # not Ctrl+Shift+S: that is the global capture hotkey
+        self._action("copy", "&Copy Image to Clipboard", self.copy_image, QKeySequence.Copy,
+                     glyph_icon("copy"), "Copy to clipboard (Ctrl+C)")
+        self._action("close", "&Close", self.close, "Ctrl+W", glyph_icon("close"))
+        # Edit
+        undo = c.undo_stack.createUndoAction(self, "&Undo")
+        undo.setShortcut(QKeySequence.Undo)
+        undo.setIcon(glyph_icon("undo"))
+        redo = c.undo_stack.createRedoAction(self, "&Redo")
+        redo.setShortcut(QKeySequence.Redo)
+        redo.setIcon(glyph_icon("redo"))
+        self.act["undo"], self.act["redo"] = undo, redo
+        self._action("delete", "&Delete\tDel", c.delete_selected, icon=glyph_icon("delete"),
+                     tip="Delete selected objects (Del)")
+        self._action("select_all", "Select &All Objects", self._select_all, "Ctrl+Shift+A",
+                     glyph_icon("select_all"))
+        # Object
+        self._action("colour", "Change &Colour...", self._pick_color,
+                     icon=swatch_icon(c.color), tip="Colour of the selected objects and new objects")
+        self._action("front", "Bring to &Front", lambda: self._reorder(True))
+        self._action("back", "Send to &Back", lambda: self._reorder(False))
+        # View (toolbar only)
+        self._action("zoom_out", "Zoom Out", lambda: c.zoom_by(1 / 1.25), icon=glyph_icon("zoom_out"),
+                     tip="Zoom out")
+        self._action("zoom_in", "Zoom In", lambda: c.zoom_by(1.25), icon=glyph_icon("zoom_in"),
+                     tip="Zoom in (Ctrl + mouse wheel)")
+        self._action("fit", "Fit", c.reset_view, tip="Fit image to window")
+        self._action("actual", "100%", c.actual_size, tip="Actual size")
+        # Help
+        self._action("shortcuts", "&Keyboard Shortcuts", self._show_shortcuts)
+        self._action("about", "&About SnipLab", self._show_about)
+
+        # Tool palette actions (shared by the palette and the Object menu)
         group = QActionGroup(self)
         group.setExclusive(True)
         for name, label, tip in TOOLS:
-            act = QAction(label, self, checkable=True)
-            act.setToolTip(tip)
-            act.setData(name)
-            act.triggered.connect(lambda _=False, n=name: self.canvas.set_tool(n))
+            act = QAction(tool_icon(name), label, self, checkable=True)
+            act.setToolTip(f"{label} - {tip}")
+            act.setStatusTip(tip)
+            act.triggered.connect(lambda _=False, n=name: self._set_tool(n))
             group.addAction(act)
-            tb.addAction(act)
-            if name == "select":
-                act.setChecked(True)
+            self.tool_actions[name] = act
+        self.tool_actions["select"].setChecked(True)
 
+    def _build_menus(self):
+        mb = self.menuBar()
+        a = self.act
+
+        file_menu = mb.addMenu("&File")
+        file_menu.addActions([a["save"], a["save_as"]])
+        file_menu.addSeparator()
+        file_menu.addAction(a["copy"])
+        file_menu.addSeparator()
+        file_menu.addAction(a["close"])
+
+        edit_menu = mb.addMenu("&Edit")
+        edit_menu.addActions([a["undo"], a["redo"]])
+        edit_menu.addSeparator()
+        edit_menu.addActions([a["select_all"], a["delete"]])
+
+        obj_menu = mb.addMenu("&Object")
+        for name, _label, _tip in TOOLS:
+            obj_menu.addAction(self.tool_actions[name])
+        obj_menu.addSeparator()
+        obj_menu.addAction(a["colour"])
+        obj_menu.addActions([a["front"], a["back"]])
+        obj_menu.addSeparator()
+        obj_menu.addAction(a["delete"])
+
+        help_menu = mb.addMenu("&Help")
+        help_menu.addActions([a["shortcuts"], a["about"]])
+
+    def _build_top_toolbar(self):
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(20, 20))
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly if has_glyph_font() else Qt.ToolButtonTextOnly)
+        self.addToolBar(Qt.TopToolBarArea, tb)
+        a = self.act
+
+        tb.addActions([a["save"], a["save_as"], a["copy"]])
         tb.addSeparator()
-        self.color_action = QAction("Colour", self)
-        self.color_action.triggered.connect(self._pick_color)
-        tb.addAction(self.color_action)
-        self._refresh_color_icon()
-
-        tb.addWidget(QLabel(" Width "))
+        tb.addActions([a["undo"], a["redo"]])
+        tb.addSeparator()
+        tb.addAction(a["colour"])
+        tb.addWidget(QLabel("  Width "))
         spin = QSpinBox()
         spin.setRange(1, 40)
         spin.setValue(self.canvas.pen_width)
+        spin.setToolTip("Line width for new objects")
         spin.valueChanged.connect(lambda v: setattr(self.canvas, "pen_width", v))
         tb.addWidget(spin)
-
         tb.addSeparator()
-        undo = self.canvas.undo_stack.createUndoAction(self, "Undo")
-        undo.setShortcut(QKeySequence.Undo)
-        redo = self.canvas.undo_stack.createRedoAction(self, "Redo")
-        redo.setShortcut(QKeySequence.Redo)
-        tb.addAction(undo)
-        tb.addAction(redo)
+        tb.addActions([a["zoom_out"], a["zoom_in"], a["fit"], a["actual"]])
+        # "Fit" and "100%" have no icon, so always show them as text
+        for key in ("fit", "actual", "colour"):
+            btn = tb.widgetForAction(a[key])
+            if btn is not None:
+                btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon if key == "colour"
+                                       else Qt.ToolButtonTextOnly)
 
-        tb.addSeparator()
-        for text, handler, shortcut in [
-            ("Copy", self.copy_image, QKeySequence.Copy),
-            ("Save", self.save, QKeySequence.Save),
-            ("Save As...", self.save_as, QKeySequence("Ctrl+Shift+S")),
-            ("Fit", self.canvas.reset_view, None),
-            ("100%", self.canvas.actual_size, None),
-        ]:
-            act = QAction(text, self)
-            if shortcut is not None:
-                act.setShortcut(shortcut)
-            act.triggered.connect(lambda _=False, h=handler: h())
-            tb.addAction(act)
+    def _build_tool_palette(self):
+        tb = QToolBar("Tools", self)
+        tb.setOrientation(Qt.Vertical)
+        tb.setMovable(False)
+        tb.setIconSize(QSize(28, 28))
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.addToolBar(Qt.LeftToolBarArea, tb)
+        groups = [["select"], ["rect", "ellipse", "line", "arrow"],
+                  ["text", "highlight", "blur", "step"], ["crop"]]
+        for i, names in enumerate(groups):
+            if i:
+                tb.addSeparator()
+            for n in names:
+                tb.addAction(self.tool_actions[n])
 
-    def _refresh_color_icon(self):
-        pix = QPixmap(16, 16)
-        pix.fill(self.canvas.color)
-        from PySide6.QtGui import QIcon
-        self.color_action.setIcon(QIcon(pix))
+    def _build_status_bar(self):
+        sb = self.statusBar()
+        self.lbl_tool = QLabel()
+        self.lbl_size = QLabel()
+        self.lbl_cursor = QLabel("")
+        self.lbl_zoom = QLabel("100%")
+        for lbl, width in ((self.lbl_tool, 110), (self.lbl_cursor, 110),
+                           (self.lbl_size, 110), (self.lbl_zoom, 60)):
+            lbl.setMinimumWidth(width)
+            sb.addPermanentWidget(lbl)
+        sb.showMessage("Ready")
+        self._set_tool_label("select")
+        self._update_size_label(self.canvas.sceneRect())
+        self.canvas.cursor_moved.connect(lambda x, y: self.lbl_cursor.setText(f"{x}, {y} px"))
+        self.canvas.zoom_changed.connect(lambda z: self.lbl_zoom.setText(f"{z * 100:.0f}%"))
+        self.canvas.scene().sceneRectChanged.connect(self._update_size_label)
+
+    def _update_size_label(self, rect: QRectF):
+        self.lbl_size.setText(f"{int(rect.width())} x {int(rect.height())} px")
+
+    def _set_tool_label(self, name: str):
+        label = next(l for n, l, _ in TOOLS if n == name)
+        self.lbl_tool.setText(f"Tool: {label}")
+
+    # --- handlers ------------------------------------------------------------
+    def _set_tool(self, name: str):
+        self.canvas.set_tool(name)
+        self._set_tool_label(name)
+
+    def _select_all(self):
+        self.tool_actions["select"].trigger()
+        self.canvas.select_all()
+
+    def _reorder(self, to_front: bool):
+        n = self.canvas.reorder(to_front)
+        if not n:
+            self.statusBar().showMessage("Select an object first", 3000)
 
     def _pick_color(self):
         c = QColorDialog.getColor(self.canvas.color, self, "Annotation colour")
         if c.isValid():
             self.canvas.color = c            # also the colour for new annotations
-            self._refresh_color_icon()
+            self.act["colour"].setIcon(swatch_icon(c))
             n = self.canvas.apply_color(c)   # and recolour whatever is selected
             if n:
-                self.statusBar().showMessage(f"Changed colour of {n} item(s)", 3000)
+                self.statusBar().showMessage(f"Changed colour of {n} object(s)", 3000)
 
     def _update_title(self):
         self.setWindowTitle(f"SnipLab - {self.path.name}")
 
-    # --- actions ----------------------------------------------------------
+    def _show_shortcuts(self):
+        QMessageBox.information(self, "Keyboard shortcuts", (
+            "Ctrl+S\tSave\n"
+            "F12\tSave As\n"
+            "Ctrl+C\tCopy image to clipboard\n"
+            "Ctrl+Z / Ctrl+Y\tUndo / Redo\n"
+            "Del\tDelete selected objects\n"
+            "Ctrl+Shift+A\tSelect all objects\n"
+            "Ctrl+W\tClose editor\n"
+            "Ctrl + mouse wheel\tZoom\n\n"
+            "Global capture hotkeys:\n"
+            "Ctrl+Shift+S\tRegion\n"
+            "Ctrl+Shift+F\tFull screen\n"
+            "Ctrl+Shift+W\tActive window"))
+
+    def _show_about(self):
+        QMessageBox.about(self, "About SnipLab",
+                          f"<b>SnipLab {__version__}</b><br>Screen capture and annotation.")
+
+    # --- file actions ----------------------------------------------------------
     def copy_image(self):
         focus = self.canvas.scene().focusItem()
         if isinstance(focus, TextItem):
