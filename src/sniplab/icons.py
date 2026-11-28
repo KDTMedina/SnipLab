@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QPainter,
-                           QPen, QPixmap, QPolygonF)
+                           QPainterPath, QPen, QPixmap, QPolygonF)
 
 # Segoe MDL2 Assets / Segoe Fluent Icons code points
 GLYPHS = {
@@ -115,6 +115,19 @@ def tool_icon(name: str, size: int = 28) -> QIcon:
         p.setFont(f)
         p.setPen(Qt.white)
         p.drawText(QRectF(3, 3, 22, 22), Qt.AlignCenter, "1")
+    elif name == "freehand":
+        path = QPainterPath(QPointF(4, 20))
+        path.cubicTo(QPointF(7, 3), QPointF(14, 3), QPointF(14, 14))
+        path.cubicTo(QPointF(14, 25), QPointF(21, 24), QPointF(24, 8))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+    elif name == "bubble":
+        p.setBrush(Qt.NoBrush)
+        body = QPainterPath()
+        body.addRoundedRect(QRectF(3, 4, 22, 15), 5, 5)
+        tail = QPainterPath()
+        tail.addPolygon(QPolygonF([QPointF(8, 18), QPointF(6, 25), QPointF(14, 18)]))
+        p.drawPath(body.united(tail))
     elif name == "crop":
         p.drawPolyline(QPolygonF([QPointF(9, 3), QPointF(9, 19), QPointF(25, 19)]))
         p.drawPolyline(QPolygonF([QPointF(3, 9), QPointF(19, 9), QPointF(19, 25)]))
@@ -127,5 +140,23 @@ def swatch_icon(color: QColor, size: int = 20) -> QIcon:
     p.setPen(QPen(_text_color(), 1))
     p.setBrush(color)
     p.drawRoundedRect(QRectF(2, 2, size - 4, size - 4), 3, 3)
+    p.end()
+    return QIcon(pix)
+
+
+def align_icon(kind: str, size: int = 18) -> QIcon:
+    """Text alignment icon: 'left', 'center' or 'right'."""
+    pix, p = _canvas(size)
+    p.setPen(QPen(_text_color(), 1.6, Qt.SolidLine, Qt.RoundCap))
+    s = size / 18.0
+    p.scale(s, s)
+    for y, w in ((3, 14), (7, 8), (11, 14), (15, 6)):
+        if kind == "left":
+            x = 2
+        elif kind == "center":
+            x = (18 - w) / 2
+        else:
+            x = 16 - w
+        p.drawLine(QPointF(x, y), QPointF(x + w, y))
     p.end()
     return QIcon(pix)
